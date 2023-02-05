@@ -1,0 +1,6 @@
+id=dnsserver
+name=Android dnsserver
+version=v1
+versionCode=1
+author=machaa
+description=Serve my own dns

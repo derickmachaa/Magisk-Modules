@@ -1,0 +1,70 @@
+#!/system/bin/sh
+##This file is just a simple script to start and stop charging at certain values
+##REDMI 9A lineageos 19.1
+
+#check if process is already running
+PIDFILE='/data/local/tmp/batt.pid'
+
+if [[ -f $PIDFILE ]];then
+	PID=`cat $PIDFILE 2>/dev/null`
+	if [ -d /proc/$PID ] && [[ $PID -ne "" ]];then
+		echo "process already running with pid: $PID"
+		exit 1
+	else
+		echo $$ > $PIDFILE
+		if [ $? -ne 0 ];then
+			echo "could not create file"
+			exit 1
+		fi
+	fi
+else
+	echo $$ > $PIDFILE
+fi
+
+
+function enable_charging(){
+	#enabling  charging
+	echo 1 > /sys/class/power_supply/battery/charging_enabled
+	#write result to a permanent file
+	echo 1 > /data/adb/batt
+}
+
+function disable_charging(){
+	#disable charging
+	echo 0 > /sys/class/power_supply/battery/charging_enabled
+	#write result to a permanent file
+	echo 0 > /data/adb/batt
+}
+
+#start charge
+startc=25
+#stop charge
+stopc=85
+
+#watch the battery percentage
+#get current battery capacity
+capacity=`cat /sys/class/power_supply/battery/capacity`	
+
+#Check if charger connected
+charger=`cat /sys/class/power_supply/charger/online`
+
+if [[ $capacity -lt $startc ]] || [[ $capacity -eq $startc ]];then
+       if [[ $charger -eq  1 ]];then
+	       #charger is present start charging
+	       enable_charging
+       fi
+       if [[ $charger -eq 0 ]];then
+	       #charger is not present
+	       echo doing nothing
+       fi
+fi
+
+if [[ $capacity -gt $stopc ]] || [[ $capacity -eq $stopc ]];then
+	if [[ $charger -eq 1 ]];then
+		#charger is present stop charging
+		disable_charging
+	fi
+fi
+
+#allow the pid to work nicely
+sleep 0.5

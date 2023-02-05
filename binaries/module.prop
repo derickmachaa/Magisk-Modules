@@ -1,0 +1,6 @@
+id=binaries
+name=Binaries Module
+version=v1
+versionCode=1
+author=machaa
+description=A module place executable binaries

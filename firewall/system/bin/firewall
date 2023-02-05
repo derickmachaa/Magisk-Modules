@@ -1,0 +1,520 @@
+#!/system_ext/bin/bash 
+	##action and reaction are equal and opposite..since our policy is drop..so for every input there must be an equal output
+
+##useful variables
+#My custom DNS port...this is where all dns requests will be forwarded..use zero if none
+#_my_dns_port=0
+_my_dns_port=5353
+_dns_id=dns
+#nflog-group for logging
+_nflog_group=7
+# Tor's Dns
+_tor_dns_port=55353
+#Tor's Transport
+_tor_trans_port=59040
+#Tor's ID
+_isolate_uid=10150
+# Tor's VirtualAddrNetworkIPv4
+_virt_addr="10.192.0.0/10"
+#tethering interfaces
+_teth_ifaces=(ap0 rndis0 bt-pan)
+#internet interfaces 
+_internet_ifaces=(ccmni0 ccmni1)
+#allowed apps file i.e file where apps with access are defined
+_apps_allow=/data/var/firewall/apps.txt
+#allowed ips file i.e file where ip addresses with access are defined
+_ips_allow=/data/var/firewall/ips.txt
+#ip addresses which should not be routed through tor
+_non_tor="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+function clean(){
+	##Drop all Rules and clean the table;set all policies to allow
+	iptables -F
+	iptables -t nat -F
+	iptables -t mangle -F
+	iptables -t raw -F
+	
+	###DROP Everything Else including ipv6
+	iptables -P FORWARD DROP
+	iptables -P INPUT DROP
+	iptables -P OUTPUT DROP
+	ip6tables -P FORWARD DROP
+	ip6tables -P INPUT DROP
+	ip6tables -P OUTPUT DROP
+}
+
+function ip_to_hex(){
+	#take an ip and return it in hex so that it can be used in quotas
+	echo 0x`printf '%02x' ${1//./ }`
+}
+
+function modify_file(){
+	#modify the files for authorization
+	fil=$1
+	old_value=$3
+	new_value=$4
+	if [[ "$2" == add ]];then
+		sed -i "/$old_value/d" $fil
+		echo "$new_value" >> $fil
+	else
+		sed -i "/$old_value/d" $fil
+	fi	
+	
+}
+
+function create(){
+	##Create New Chains
+	iptables -N angel-Allow
+	iptables -N angel-Forward
+	iptables -N angel-Output
+	iptables -N angel-Reject
+}
+
+
+function begin(){
+   		#allow machine to talk to itself
+	iptables -A INPUT -i lo -j ACCEPT
+	iptables -A OUTPUT -o lo -j ACCEPT
+
+		#allow ping requests
+	iptables -A INPUT -p icmp -j ACCEPT
+	iptables -A OUTPUT -p icmp -j ACCEPT
+
+   		#allow ssh on all interfaces
+	iptables -A angel-Allow -p tcp -m multiport --dports 22,2222 -j ACCEPT
+	iptables -A angel-Output -p tcp -m multiport --sports 22,2222 -j ACCEPT
+
+   		#allow http,https on all interfaces
+	iptables -A angel-Allow -p tcp -m multiport --dports 80,443 -j ACCEPT
+	iptables -A angel-Output -p tcp -m multiport --sports 80,443 -j ACCEPT
+
+	
+	#allow outgoing dns requests to my dns_server if is set
+	if [[ $_my_dns_port != 0 ]];then
+		for i in udp tcp
+		do
+				#allow incoming dns requests set to that port
+			iptables -A angel-Allow -p $i --dport $_my_dns_port -j ACCEPT
+				#allow outgoing responses
+			iptables -A angel-Output -p $i -m owner --uid-owner $_dns_id -j ACCEPT
+			iptables -A angel-Output -p $i --dport $_my_dns_port -j ACCEPT
+				#reidrect local and incoming traffic to that port
+			iptables -t nat -A PREROUTING -m $i -p $i --dport 53 -j REDIRECT --to-ports $_my_dns_port
+			iptables -t nat -A OUTPUT -m $i -p $i --dport 53 -m owner ! --uid-owner $_dns_id -j REDIRECT --to-ports $_my_dns_port
+		done
+		
+	else
+	for i in udp tcp
+	do
+			#Allow incoming dns requests on all interfaces
+		iptables -A angel-Allow -p $i --dport 53 -j ACCEPT
+		iptables -A angel-Output -p $i --sport 53 -j ACCEPT
+			#Allow outgoing dns requests
+		iptables -A angel-Output -p $i --dport 53 -j ACCEPT
+	done
+
+	fi
+		
+		#allow tor uid to fully communicate
+	iptables -A angel-Output -m owner --uid-owner $_isolate_uid -j ACCEPT
+
+		#allow dhcp for ip addressing in tethering interfaces
+	for i in ${_teth_ifaces[@]}
+	do
+		iptables -A angel-Allow -i $i -p udp --dport 67:68 -m state --state NEW -j ACCEPT
+		iptables -A angel-Output -o $i -p udp --sport 67:68 -j ACCEPT
+
+	done
+	
+}
+
+function nat_tor(){
+		#start/stop routing all traffic from tor
+		#pass all nat traffic through tor if argument 1 is -A
+		#anonymize middlebox
+		
+		### *nat PREROUTING (For middlebox)
+		for i in ${_teth_ifaces[@]}
+		do
+			iptables -t nat $1 PREROUTING -d $_virt_addr -i $i -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j REDIRECT --to-ports $_tor_trans_port
+			iptables -t nat $1 PREROUTING -i $i -p udp --dport 53 -j REDIRECT --to-ports $_tor_dns_port
+			for ips in $_non_tor
+			do
+				iptables -t nat $1 PREROUTING -i $i -d $ips -j RETURN
+			done
+			#*nat PREROUTING (For middlebox)
+			iptables -t nat $1 PREROUTING -i $i -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j REDIRECT --to-ports $_tor_trans_port
+		done
+}
+
+
+function tor_control(){
+	#ADD or DELETE ip from/to routing traffic through tor
+	_ip=$2
+	intf=$3
+	quota=$4
+	#will be inserted from bottom to up
+	#*nat PREROUTING (For middlebox)
+	iptables -t nat $1 PREROUTING -i $intf -s $_ip -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j REDIRECT --to-ports $_tor_trans_port
+	for ips in $_non_tor
+	do
+		iptables -t nat $1 PREROUTING -i $intf -s $_ip -d $ips -j RETURN
+	done
+	iptables -t nat $1 PREROUTING -i $intf -s $_ip -p udp --dport 53 -j REDIRECT --to-ports $_tor_dns_port
+	iptables -t nat $1 PREROUTING -d $_virt_addr -i $intf -s $_ip -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -j REDIRECT --to-ports $_tor_trans_port
+
+
+
+	#MARK them packets
+	for proto in tcp udp
+	do
+		iptables -t mangle $1 INPUT -i $intf -s $_ip -p $proto --dport $_tor_trans_port -j MARK --set-mark `ip_to_hex $_ip`
+		iptables -t mangle $1 OUTPUT -o $intf -d $_ip -p $proto --sport $_tor_trans_port -j MARK --set-mark `ip_to_hex $_ip`
+	done
+
+	#Drop packets if quota
+	if [[ $quota != "" ]];then
+		iptables $1 OUTPUT -m mark --mark `ip_to_hex $_ip` -m quota2 --name $_ip ! --quota $(( 1024*1024*$quota )) -j REJECT
+		#else packets will be allowed since tor uid is accept
+	fi
+}
+
+
+function nat_control(){
+	#add or delete ip to/from nat access
+	_ip=$2
+	intf=$3
+	quota=$4
+	
+	#Mark the connections maybe used further in quotas
+	for i in ${_internet_ifaces[@]}
+	do
+		iptables -t mangle $1 FORWARD -i $intf -s $_ip -o $i -j MARK --set-mark `ip_to_hex $_ip`
+		iptables -t mangle $1 FORWARD -o $intf -d $_ip -i $i -j MARK --set-mark `ip_to_hex $_ip`
+	done
+
+	#FORWARD
+	#check if quota enable and specify quota
+	if [[ "$quota" == "" ]];then
+		for i in ${_internet_ifaces[@]}
+		do
+			#if no quota allow
+			iptables $1 angel-Forward -i $intf -s $_ip -j ACCEPT
+			iptables $1 angel-Forward -o $intf -d $_ip -j ACCEPT
+		done
+	else
+		#allow according to quota..quota given in mbs
+		iptables $1 angel-Forward  -m mark --mark `ip_to_hex $_ip` -m quota2 --name $_ip --quota $(( 1024*1024*$quota )) -j ACCEPT
+
+	fi
+
+	#POSTROUTING
+	#now add postrouting for snat
+	for i in ${_internet_ifaces[@]}
+	do
+		iptables -t nat $1 POSTROUTING -o $i -s $_ip -j MASQUERADE
+	done
+				
+}
+
+
+function nat_main(){
+	#check if all nat should go through tor
+	#anonymize ip(s) with tor flag on, in ip files
+	REGEX="^[^#].*$"
+	while read -r ips
+	do
+		if [[ $ips =~ $REGEX ]];then
+			_ip=`echo $ips|cut -d "," -f 1`
+			_quota=`echo $ips|cut -d "," -f 2`
+			_tor=`echo $ips|cut -d "," -f 3`
+			_int_face=`echo $ips|cut -d "," -f 4-`
+			if [[ "$_tor" == "1" ]];then
+				for intf in $_int_face
+				do
+					tor_control -A $_ip $intf $_quota
+				done
+			else
+				#allow clearnet traffic
+				for intf in  $_int_face
+				do
+					nat_control -A $_ip $intf $_quota
+				done
+			fi
+		fi
+		done <$_ips_allow
+}
+
+
+function app_control(){
+	_uid=$2
+	intf=$3
+	for p in tcp udp
+	do
+		if [[ "$intf" == "" ]];then
+		iptables $1 angel-Output -p $p -m owner --uid-owner $_uid -j ACCEPT
+		else
+		iptables $1 angel-Output -o $intf -p $p -m owner --uid-owner $_uid -j ACCEPT
+		fi
+	done
+}
+function tor_app_control(){
+	_uid=$2
+	iptables -t nat $1 OUTPUT ! -o lo -p tcp -m owner --uid-owner $_uid -m tcp -j REDIRECT --to-ports $_tor_trans_port
+	iptables -t nat $1 OUTPUT -d $_virt_addr -m owner --uid-owner $_uid -p tcp -j REDIRECT --to-ports $_tor_trans_port
+	iptables -t nat $1 OUTPUT ! -o lo -p udp -m owner --uid-owner $_uid -m udp --dport 53 -j REDIRECT --to-ports $_tor_dns_port
+	iptables $1 angel-Output -p tcp --dport $_tor_trans_port -m owner --uid-owner $_uid -j ACCEPT
+
+	
+}
+
+
+function app_main(){
+	#Control apps access file
+	REGEX="^[^#].*$"
+	while read line
+	do
+	if [[ $line =~ $REGEX ]];then
+		_uid=`echo $line|cut -d "," -f 1`
+		_tor=`echo $line|cut -d "," -f 2`
+		_int_face=`echo $line|cut -d "," -f 3-`
+	
+		if [[ $_tor == 1 ]];then
+			#disable clearnet 
+			tor_app_control -A $_uid
+		else
+			if [[ "$_int_face" == "" ]];then
+				app_control -A $_uid $intf
+			else
+				for intf in $_int_face
+				do
+					app_control -A $_uid $intf
+				done
+			fi
+		fi
+	fi
+	done <$_apps_allow
+}
+
+
+function end(){
+		##REJECT ALL NON-MATCHING
+	iptables -A angel-Reject -j NFLOG --nflog-group $_nflog_group --nflog-prefix "Access Denied"
+	iptables -A angel-Reject -p tcp -j REJECT --reject-with tcp-reset
+	iptables -A angel-Reject -p udp -j REJECT --reject-with icmp-port-unreachable
+	iptables -A angel-Allow -j angel-Reject
+	iptables -A angel-Forward -j angel-Reject
+	iptables -A angel-Output -j angel-Reject
+		##INPUT
+	iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A INPUT -j angel-Allow
+		##FORWARD
+	#iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A FORWARD -j angel-Forward
+		##OUTPUT
+	iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A OUTPUT -j angel-Output
+}
+function start_tor(){
+	#start full nat tor
+	clean;create;begin;nat_tor -A;end
+}
+
+function firewall_start(){
+	#check if the firewall is already running
+	iptables -vL angel-Allow &>/dev/null
+	if [[ $? -ne 0 ]];then
+		#to start the firewall first we have to save current rules
+		iptables-save > /data/var/firewall/rules
+		sed -i 's/--quota/! --quota/' /data/var/firewall/rules
+		sed -i 's/! --name/--name/' /data/var/firewall/rules
+		clean;create;begin;app_main;nat_main;end
+
+	else
+		#alert the firewall is already running
+		echo "[+] firewall already running"
+	fi
+}
+
+function firewall_stop(){
+	#stop the firewall
+	iptables-restore < /data/var/firewall/rules
+	echo "[-] You are on your own sir"
+
+}
+
+function load_help(){
+	#starts the firewall
+echo -e "
+load,
+	 -a #run the firewall with nat enabled else run firewall without nat enabled
+"
+}
+function app_help(){
+echo -e "
+app,
+	 enable app_uid interface ##Enable an app on the given interface(s) multiple can be specified with comma
+	 disable app_uid interface ##Disable an app for accessing data in a interface(s) multiple can be specified with comma
+	 torify app_uid start ##start routing all traffic regardless of an interface through tor
+	 torify app_uid stop ##start routing all traffic regardless of an interface through tor
+"
+}
+function nat_help(){
+echo -e "
+nat,
+	 enable ip_addr  torify interface quota #quota can be left out if not required
+	 disable ip_addr torify interface quota "
+
+}
+function tor_help(){
+echo -e "
+tor,
+ 	 start ##start routing all phone traffic through tor
+	 stop  ##stop routing all phone traffic through tor
+"
+}
+function help(){
+name=`basename "$0"`
+echo -e "USAGE: $name Target [Options]
+Small api to interact with firewall.
+valid Targets::
+ load
+ app
+ nat
+ tor
+Options:::"
+ load_help
+ app_help
+ nat_help
+ tor_help
+echo -e "
+N.B order of options is required
+Examples:
+$name app enable 10070
+$name app torify 10063 start
+$name tor start
+$name nat enable 192.168.43.1 0 ap0 200 #allow 200mb of bandwith without tor
+$name load #enable firewall
+"
+exit 1
+}
+target="$1"
+case $target in
+	app)
+		if [[ $# -lt 3 ]] || [[ $# -gt 4 ]];then
+			echo "Missing or invalid options"
+			app_help
+			exit 1
+		else
+			action="$2";_uid="$3";interface=`echo $4|tr ',' ' '`
+
+			case $action in
+				enable)
+					echo enabling app $_uid
+					for intf in ${interface:-\*}
+					do
+						app_control -I $_uid `echo $intf|tr -d \*`
+					done
+					modify_file $_apps_allow add $_uid "$_uid,0,$interface"
+					;;
+				disable)
+					echo disabling $uid
+					for intf in ${interface:-\*}
+					do
+						app_control -D $_uid `echo $intf|tr -d \*`
+					done
+					modify_file $_apps_allow del $_uid
+					;;
+				torify)
+					if [[ "$4" == "start" ]];then
+						echo start torifying $uid
+						tor_app_control -I $_uid
+						modify_file $_apps_allow add $_uid "$_uid,1"	
+					elif [[ "$4" == "stop" ]];then
+						echo stop torifying $uid
+						tor_app_control -D $_uid
+						modify_file $_apps_allow del "$_uid,1"
+					else
+						echo expecting start or stop
+						exit 1
+					fi
+					;;
+				*)
+					echo "invaid option"
+					app_help
+					exit 1
+			esac
+
+		fi
+		;;
+	nat)
+		if [[ $# -lt 4 ]] || [[ $# -gt 6 ]];then
+			echo "Missing or invalid options"
+			exit 1
+		else
+			action="$2";_ip="$3";torify="$4";interface=`echo "$5"|tr ',' ' '`;quota="$6"
+			if [[ "$action" == "enable" ]] && [[ "$torify" == "1" ]];then
+				for intf in ${interface:-\*}
+				do
+					tor_control -I $_ip `echo $intf|tr -d \*` $quota
+				done
+			modify_file $_ips_allow add $_ip "$_ip,$quota,$torify,$interface"	
+	
+			elif [[ "$action" == "enable" ]] && [[ "$torify" == "0" ]];then
+				for intf in ${interface:-\*}
+				do
+					nat_control -I $_ip `echo $intf|tr -d \*` $quota
+				done
+
+			elif [[ "$action" == "disable" ]] && [[ "$torify" == "1" ]];then
+				for intf in ${interface:-\*}
+				do
+					tor_control -D $_ip `echo $intf|tr -d \*` $quota
+				done
+
+			elif [[ "$action" == "disable" ]] && [[ "$torify" == "0" ]];then
+				for intf in ${interface:-\*}
+				do
+					nat_control -D $_ip `echo $intf|tr -d \*` $quota
+				done
+			else
+				echo missing or invalid option
+				exit 1
+			fi
+
+		fi
+		;;
+	tor)
+		if [[ $# -ne 2 ]];then
+			echo missing or invalid option
+			exit 1
+		else
+			action="$2";uid="$3"
+			case $action in
+				start)
+					echo "starting full tor"
+					start_tor
+					;;
+				stop)
+					nat_tor -D
+					;;
+					*)
+					echo "expecting start or stop"
+					;;
+			esac
+		fi
+		;;
+	reload)
+		clean;create;begin;app_main;end
+		;;
+	start)
+		firewall_start
+		;;
+	stop)
+		firewall_stop
+		;;
+	*)
+		help
+		;;
+
+esac

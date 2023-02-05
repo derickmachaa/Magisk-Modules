@@ -1,0 +1,6 @@
+id=bootanimation
+name=Bootanimation Module
+version=v1
+versionCode=1
+author=machaa
+description=A module to change boot animation systemlessly
